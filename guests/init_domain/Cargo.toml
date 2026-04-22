@@ -1,0 +1,9 @@
+[package]
+name = "init_domain"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[[bin]]
+name = "init_domain"
+path = "src/main.rs"
