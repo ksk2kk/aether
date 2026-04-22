@@ -7,7 +7,7 @@ use core::panic::PanicInfo;
 #[inline(always)]
 unsafe fn hypercall(nr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> (u64, u64, u64) {
     let rax: u64;
-    let rbx: u64;
+    let r12: u64;
     let rcx: u64;
     asm!(
         "vmcall",
@@ -18,10 +18,10 @@ unsafe fn hypercall(nr: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u
         in("r8")  arg4,
         in("r9")  arg5,
         lateout("rax") rax,
-        lateout("rbx") rbx,
+        lateout("r12") r12,
         options(nostack)
     );
-    (rax, rbx, rcx)
+    (rax, r12, rcx)
 }
 
 struct DebugOut;
