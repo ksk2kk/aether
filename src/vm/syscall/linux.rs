@@ -1,6 +1,13 @@
 use crate::arch::x86_64::vmx::GuestRegisters;
 use crate::vm::hypercall::utils::{copy_guest_gpa_bytes, copy_bytes_to_guest_gpa};
 use crate::vm::fs::{get_vfs, OpenFlags, FileMode, SeekFrom, Stat};
+use crate::memory::ept::EptManager;
+use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
+use alloc::string::String;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use spin::Mutex;
 use super::SyscallHandler;
 
 const SYS_READ: u64 = 0;
@@ -406,6 +413,174 @@ const CLOCK_BOOTTIME: i32 = 7;
 const CLOCK_REALTIME_ALARM: i32 = 8;
 const CLOCK_BOOTTIME_ALARM: i32 = 9;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessState {
+    Running,
+    Runnable,
+    Sleeping,
+    Stopped,
+    Zombie,
+}
+
+#[derive(Debug, Clone)]
+pub struct Process {
+    pub pid: i32,
+    pub ppid: i32,
+    pub state: ProcessState,
+    pub exit_code: i32,
+    pub uid: u32,
+    pub gid: u32,
+    pub euid: u32,
+    pub egid: u32,
+    pub thread_group: i32,
+    pub children: Vec<i32>,
+    pub waiters: Vec<i32>,
+}
+
+impl Process {
+    pub fn new(pid: i32, ppid: i32) -> Self {
+        Self {
+            pid,
+            ppid,
+            state: ProcessState::Running,
+            exit_code: 0,
+            uid: 0,
+            gid: 0,
+            euid: 0,
+            egid: 0,
+            thread_group: pid,
+            children: Vec::new(),
+            waiters: Vec::new(),
+        }
+    }
+}
+
+pub struct ProcessManager {
+    processes: BTreeMap<i32, Process>,
+    next_pid: i32,
+    current_pid: i32,
+}
+
+impl ProcessManager {
+    pub fn new() -> Self {
+        let mut processes = BTreeMap::new();
+        let init = Process::new(1, 0);
+        processes.insert(1, init);
+        
+        Self {
+            processes,
+            next_pid: 2,
+            current_pid: 1,
+        }
+    }
+
+    pub fn current(&self) -> Option<&Process> {
+        self.processes.get(&self.current_pid)
+    }
+
+    pub fn current_mut(&mut self) -> Option<&mut Process> {
+        self.processes.get_mut(&self.current_pid)
+    }
+
+    pub fn get(&self, pid: i32) -> Option<&Process> {
+        self.processes.get(&pid)
+    }
+
+    pub fn get_mut(&mut self, pid: i32) -> Option<&mut Process> {
+        self.processes.get_mut(&pid)
+    }
+
+    pub fn create_process(&mut self, parent_pid: i32) -> Option<i32> {
+        let pid = self.next_pid;
+        self.next_pid += 1;
+        
+        let child = Process::new(pid, parent_pid);
+        self.processes.insert(pid, child);
+        
+        if let Some(parent) = self.processes.get_mut(&parent_pid) {
+            parent.children.push(pid);
+        }
+        
+        Some(pid)
+    }
+
+    pub fn exit_process(&mut self, pid: i32, exit_code: i32) {
+        if let Some(proc) = self.processes.get_mut(&pid) {
+            proc.state = ProcessState::Zombie;
+            proc.exit_code = exit_code;
+        }
+    }
+
+    pub fn remove_zombie(&mut self, pid: i32) -> Option<i32> {
+        if let Some(proc) = self.processes.get(&pid) {
+            if proc.state == ProcessState::Zombie {
+                let exit_code = proc.exit_code;
+                self.processes.remove(&pid);
+                return Some(exit_code);
+            }
+        }
+        None
+    }
+
+    pub fn has_zombie_child(&self, ppid: i32) -> Option<i32> {
+        for (pid, proc) in &self.processes {
+            if proc.ppid == ppid && proc.state == ProcessState::Zombie {
+                return Some(*pid);
+            }
+        }
+        None
+    }
+}
+
+static PROCESS_MANAGER: Mutex<Option<ProcessManager>> = Mutex::new(None);
+
+pub fn init_process_manager() {
+    *PROCESS_MANAGER.lock() = Some(ProcessManager::new());
+    crate::log_info!("进程管理器初始化完成");
+}
+
+pub struct Pipe {
+    pub buffer: Vec<u8>,
+    pub read_end: bool,
+    pub write_end: bool,
+}
+
+impl Pipe {
+    pub fn new() -> Self {
+        Self {
+            buffer: Vec::with_capacity(4096),
+            read_end: true,
+            write_end: true,
+        }
+    }
+
+    pub fn read(&mut self, buf: &mut [u8]) -> Result<usize, i64> {
+        if self.buffer.is_empty() {
+            return Ok(0);
+        }
+        let len = core::cmp::min(buf.len(), self.buffer.len());
+        buf[..len].copy_from_slice(&self.buffer[..len]);
+        self.buffer.drain(..len);
+        Ok(len)
+    }
+
+    pub fn write(&mut self, buf: &[u8]) -> Result<usize, i64> {
+        if self.buffer.len() + buf.len() > 65536 {
+            return Err(-EAGAIN);
+        }
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+}
+
+static mut PIPES: Option<BTreeMap<i32, Arc<Mutex<Pipe>>>> = None;
+
+pub fn init_pipes() {
+    unsafe {
+        PIPES = Some(BTreeMap::new());
+    }
+}
+
 pub struct LinuxSyscallHandler;
 
 static mut BRK_CURRENT: u64 = 0x4000_0000;
@@ -456,9 +631,11 @@ impl SyscallHandler for LinuxSyscallHandler {
             SYS_INOTIFY_INIT | SYS_INOTIFY_INIT1 => 8,
             SYS_INOTIFY_ADD_WATCH => 1,
             SYS_INOTIFY_RM_WATCH => 0,
-            SYS_CLONE | SYS_FORK | SYS_VFORK => ENOSYS as u64,
-            SYS_EXECVE => ENOSYS as u64,
-            SYS_WAIT4 => ENOSYS as u64,
+            SYS_CLONE => sys_clone(regs),
+            SYS_FORK => sys_fork(regs),
+            SYS_VFORK => sys_vfork(regs),
+            SYS_EXECVE => sys_execve(regs),
+            SYS_WAIT4 => sys_wait4(regs),
             SYS_KILL | SYS_TGKILL => 0,
             SYS_RT_SIGACTION | SYS_RT_SIGPROCMASK => 0,
             SYS_PRCTL => sys_prctl(regs),
@@ -1378,10 +1555,6 @@ fn sys_dup2(regs: &mut GuestRegisters) -> u64 {
     }
 }
 
-fn sys_pipe(regs: &mut GuestRegisters) -> u64 {
-    ENOSYS as u64
-}
-
 fn sys_prctl(regs: &mut GuestRegisters) -> u64 {
     let option = regs.rdi as i32;
     match option {
@@ -1731,5 +1904,374 @@ fn sys_nanosleep(regs: &mut GuestRegisters) -> u64 {
         copy_bytes_to_guest_gpa(&enclave.ept, rem_gpa, &zero);
     }
 
+    0
+}
+
+fn read_argv_from_guest(ept: &EptManager, argv_gpa: u64, max_count: usize) -> Vec<String> {
+    let mut argv = Vec::new();
+    let mut index = 0usize;
+    
+    loop {
+        if index >= max_count {
+            break;
+        }
+        
+        let mut ptr_buf = [0u8; 8];
+        let n = copy_guest_gpa_bytes(ept, argv_gpa + (index * 8) as u64, &mut ptr_buf);
+        if n < 8 {
+            break;
+        }
+        
+        let ptr = u64::from_ne_bytes(ptr_buf);
+        if ptr == 0 {
+            break;
+        }
+        
+        if let Some(s) = read_string_from_ptr(ept, ptr, 4096) {
+            argv.push(s);
+        }
+        
+        index += 1;
+    }
+    
+    argv
+}
+
+fn read_string_from_ptr(ept: &EptManager, gpa: u64, max_len: usize) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let mut result = String::new();
+    let mut offset = 0u64;
+    
+    loop {
+        let n = copy_guest_gpa_bytes(ept, gpa + offset, &mut buf);
+        if n == 0 {
+            break;
+        }
+        
+        for i in 0..n {
+            if buf[i] == 0 {
+                return Some(result);
+            }
+            if buf[i].is_ascii_graphic() || buf[i] == b'/' || buf[i] == b'.' || 
+               buf[i] == b' ' || buf[i] == b'-' || buf[i] == b'_' || buf[i] == b':' ||
+               buf[i] == b'=' || buf[i] == b'@' || buf[i] == b'+' {
+                result.push(buf[i] as char);
+            } else {
+                return None;
+            }
+        }
+        
+        offset += n as u64;
+        if result.len() >= max_len {
+            break;
+        }
+    }
+    
+    Some(result)
+}
+
+fn sys_execve(regs: &mut GuestRegisters) -> u64 {
+    let path_gpa = regs.rdi;
+    let argv_gpa = regs.rsi;
+    let envp_gpa = regs.rdx;
+    
+    let path = match read_string_from_guest(path_gpa, 4096) {
+        Some(p) => p,
+        None => return (-ENOENT) as u64,
+    };
+    
+    let mut mgr = crate::enclave::get_manager();
+    let manager = match mgr.as_mut() {
+        Some(m) => m,
+        None => return (-EFAULT) as u64,
+    };
+    let cur = match manager.current_id() {
+        Some(id) => id,
+        None => return (-EFAULT) as u64,
+    };
+    let enclave = match manager.get_enclave_mut(cur) {
+        Some(e) => e,
+        None => return (-EFAULT) as u64,
+    };
+    
+    let vfs = unsafe { get_vfs().as_mut() };
+    if vfs.is_none() {
+        return (-ENOENT) as u64;
+    }
+    let vfs = vfs.unwrap();
+    
+    let flags = OpenFlags::RDONLY;
+    let mode = FileMode::from_bits_truncate(0o755);
+    
+    let fd = match vfs.open(&path, flags, mode) {
+        Ok(fd) => fd,
+        Err(e) => return (-e) as u64,
+    };
+    
+    let mut elf_data = Vec::new();
+    let mut chunk_buf = [0u8; 4096];
+    
+    loop {
+        match vfs.read(fd, &mut chunk_buf, &enclave.ept) {
+            Ok(0) => break,
+            Ok(n) => elf_data.extend_from_slice(&chunk_buf[..n]),
+            Err(e) => {
+                let _ = vfs.close(fd);
+                return (-e) as u64;
+            }
+        }
+    }
+    
+    let _ = vfs.close(fd);
+    
+    if elf_data.len() < core::mem::size_of::<crate::vm::elf::Elf64Ehdr>() {
+        return (-ENOEXEC) as u64;
+    }
+    
+    let ehdr = match crate::vm::elf::ElfLoader::validate_elf(&elf_data) {
+        Ok(e) => e,
+        Err(_) => return (-ENOEXEC) as u64,
+    };
+    
+    crate::log_info!("execve: 执行程序 '{}', 入口点 {:#x}", path, ehdr.entry_point());
+    
+    if ehdr.e_type == crate::vm::elf::ET_DYN {
+        crate::log_info!("execve: 检测到动态链接可执行文件 (PIE)");
+    }
+    
+    let load_offset = if ehdr.e_type == crate::vm::elf::ET_DYN {
+        0x4000_0000
+    } else {
+        0
+    };
+    
+    let elf_loader = crate::vm::elf::ElfLoader::new();
+    let load_result = elf_loader.load_elf(&elf_data, &mut enclave.ept, load_offset);
+    
+    match load_result {
+        Ok(info) => {
+            crate::log_info!("execve: ELF 加载成功: 入口={:#x}, 范围={:#x}-{:#x}", 
+                info.entry_point, info.lowest_vaddr, info.highest_vaddr);
+            
+            let stack_pages = 4u64;
+            let stack_base = 0x7FFF_0000;
+            let stack_size = stack_pages * 4096;
+            
+            let mut current_gpa = stack_base - stack_size;
+            let end_gpa = stack_base;
+            
+            while current_gpa < end_gpa {
+                if let Some(frame) = crate::memory::allocate_frame() {
+                    let hpa = frame.start_address();
+                    let flags = crate::memory::ept::EptFlags::READ 
+                        | crate::memory::ept::EptFlags::WRITE
+                        | crate::memory::ept::EptFlags::MEMORY_TYPE_WB;
+                    enclave.ept.map(x86_64::PhysAddr::new(current_gpa), hpa, flags);
+                }
+                current_gpa += 4096;
+            }
+            
+            regs.rax = 0;
+            regs.rsp = stack_base;
+            regs.rip = info.entry_point;
+            regs.rbp = 0;
+            regs.rbx = 0;
+            regs.rcx = 0;
+            regs.rdx = 0;
+            regs.rsi = 0;
+            regs.rdi = 0;
+            regs.r8 = 0;
+            regs.r9 = 0;
+            regs.r10 = 0;
+            regs.r11 = 0;
+            regs.r12 = 0;
+            regs.r13 = 0;
+            regs.r14 = 0;
+            regs.r15 = 0;
+            
+            unsafe { 
+                BRK_CURRENT = 0x4000_0000;
+                MMAP_NEXT = 0x7000_0000;
+            }
+            
+            crate::log_info!("execve: 程序执行环境已设置，入口点 {:#x}", info.entry_point);
+            0
+        }
+        Err(e) => {
+            crate::log_error!("execve: ELF 加载失败: {}", e);
+            (-ENOEXEC) as u64
+        }
+    }
+}
+
+fn sys_clone(regs: &mut GuestRegisters) -> u64 {
+    let flags = regs.rdi;
+    let stack = regs.rsi;
+    let parent_tid = regs.rdx;
+    let child_tid = regs.r8;
+    let tls = regs.r10;
+    
+    let is_thread = (flags & CLONE_THREAD) != 0;
+    let share_vm = (flags & CLONE_VM) != 0;
+    let share_files = (flags & CLONE_FILES) != 0;
+    let share_fs = (flags & CLONE_FS) != 0;
+    
+    crate::log_info!("clone: flags={:#x}, stack={:#x}, is_thread={}, share_vm={}",
+        flags, stack, is_thread, share_vm);
+    
+    if share_vm && is_thread {
+        crate::log_info!("clone: 创建线程 (轻量级进程)");
+        return 1;
+    }
+    
+    let mut pm_guard = PROCESS_MANAGER.lock();
+    let pm = pm_guard.as_mut();
+    if pm.is_none() {
+        return (-ENOMEM) as u64;
+    }
+    let pm = pm.unwrap();
+    
+    let parent_pid = pm.current_pid;
+    
+    let child_pid = match pm.create_process(parent_pid) {
+        Some(pid) => pid,
+        None => return (-EAGAIN) as u64,
+    };
+    
+    crate::log_info!("clone: 创建新进程，parent_pid={}, child_pid={}", parent_pid, child_pid);
+    
+    child_pid as u64
+}
+
+fn sys_fork(regs: &mut GuestRegisters) -> u64 {
+    crate::log_info!("fork: 创建子进程");
+    
+    let mut pm_guard = PROCESS_MANAGER.lock();
+    let pm = pm_guard.as_mut();
+    if pm.is_none() {
+        return (-ENOMEM) as u64;
+    }
+    let pm = pm.unwrap();
+    
+    let parent_pid = pm.current_pid;
+    
+    let child_pid = match pm.create_process(parent_pid) {
+        Some(pid) => pid,
+        None => return (-EAGAIN) as u64,
+    };
+    
+    crate::log_info!("fork: 子进程创建成功，child_pid={}", child_pid);
+    
+    child_pid as u64
+}
+
+fn sys_vfork(regs: &mut GuestRegisters) -> u64 {
+    crate::log_info!("vfork: 创建子进程 (vfork)");
+    sys_fork(regs)
+}
+
+fn sys_wait4(regs: &mut GuestRegisters) -> u64 {
+    let pid = regs.rdi as i32;
+    let wstatus_gpa = regs.rsi;
+    let options = regs.rdx as i32;
+    let rusage_gpa = regs.r10;
+    
+    let mut pm_guard = PROCESS_MANAGER.lock();
+    let pm = pm_guard.as_mut();
+    if pm.is_none() {
+        return (-ECHILD) as u64;
+    }
+    let pm = pm.unwrap();
+    
+    let current_pid = pm.current_pid;
+    
+    let zombie_pid = if pid == -1 {
+        pm.has_zombie_child(current_pid)
+    } else if pid > 0 {
+        if let Some(proc) = pm.get(pid) {
+            if proc.ppid == current_pid && proc.state == ProcessState::Zombie {
+                Some(pid)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    
+    match zombie_pid {
+        Some(zpid) => {
+            let exit_code = pm.remove_zombie(zpid).unwrap_or(0);
+            
+            if wstatus_gpa != 0 {
+                let mut mgr = crate::enclave::get_manager();
+                if let Some(manager) = mgr.as_mut() {
+                    if let Some(cur) = manager.current_id() {
+                        if let Some(enclave) = manager.get_enclave_mut(cur) {
+                            let status = ((exit_code & 0xFF) << 8) as u32;
+                            let status_bytes = status.to_ne_bytes();
+                            copy_bytes_to_guest_gpa(&enclave.ept, wstatus_gpa, &status_bytes);
+                        }
+                    }
+                }
+            }
+            
+            crate::log_info!("wait4: 回收子进程 {}，退出码 {}", zpid, exit_code);
+            zpid as u64
+        }
+        None => {
+            crate::log_debug!("wait4: 没有可回收的子进程");
+            0
+        }
+    }
+}
+
+fn sys_pipe(regs: &mut GuestRegisters) -> u64 {
+    let pipefd_gpa = regs.rdi;
+    let flags = regs.rsi as i32;
+    
+    unsafe {
+        if PIPES.is_none() {
+            init_pipes();
+        }
+    }
+    
+    let pipe = Arc::new(Mutex::new(Pipe::new()));
+    
+    let read_fd = 100;
+    let write_fd = 101;
+    
+    unsafe {
+        if let Some(pipes) = PIPES.as_mut() {
+            pipes.insert(read_fd, pipe.clone());
+            pipes.insert(write_fd, pipe);
+        }
+    }
+    
+    let mut mgr = crate::enclave::get_manager();
+    let manager = match mgr.as_mut() {
+        Some(m) => m,
+        None => return (-EFAULT) as u64,
+    };
+    let cur = match manager.current_id() {
+        Some(id) => id,
+        None => return (-EFAULT) as u64,
+    };
+    let enclave = match manager.get_enclave_mut(cur) {
+        Some(e) => e,
+        None => return (-EFAULT) as u64,
+    };
+    
+    let mut fd_buf = [0u8; 8];
+    fd_buf[..4].copy_from_slice(&(read_fd as i32).to_ne_bytes());
+    copy_bytes_to_guest_gpa(&enclave.ept, pipefd_gpa, &fd_buf);
+    
+    fd_buf[..4].copy_from_slice(&(write_fd as i32).to_ne_bytes());
+    copy_bytes_to_guest_gpa(&enclave.ept, pipefd_gpa + 4, &fd_buf);
+    
+    crate::log_info!("pipe: 创建管道，read_fd={}, write_fd={}", read_fd, write_fd);
+    
     0
 }

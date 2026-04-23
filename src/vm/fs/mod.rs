@@ -1,9 +1,11 @@
 pub mod file;
 pub mod devfs;
 pub mod ramfs;
+pub mod procfs;
 
 pub use file::{FileHandle, FileOps, SeekFrom, OpenFlags, FileMode};
 pub use ramfs::RamFileSystem;
+pub use procfs::{ProcVersion, ProcCmdline, ProcCpuinfo, ProcMeminfo, ProcUptime, ProcLoadavg, ProcStat};
 
 use crate::memory::ept::EptManager;
 use alloc::boxed::Box;
@@ -64,9 +66,63 @@ impl VirtualFileSystem {
                 .ok_or(-crate::vm::syscall::linux::ENOENT);
         }
 
+        if path.starts_with("/proc/") || path == "/proc" {
+            return self.open_proc(path, flags, mode)
+                .and_then(|handle| self.fd_table.allocate(handle))
+                .ok_or(-crate::vm::syscall::linux::ENOENT);
+        }
+
         self.root_fs.open(path, flags, mode)
             .and_then(|handle| self.fd_table.allocate(handle))
             .ok_or(-crate::vm::syscall::linux::ENOENT)
+    }
+
+    fn open_proc(&mut self, path: &str, _flags: OpenFlags, _mode: FileMode) -> Option<FileHandle> {
+        match path {
+            "/proc/version" => Some(FileHandle::new(
+                "/proc/version",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcVersion),
+            )),
+            "/proc/cmdline" => Some(FileHandle::new(
+                "/proc/cmdline",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcCmdline),
+            )),
+            "/proc/cpuinfo" => Some(FileHandle::new(
+                "/proc/cpuinfo",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcCpuinfo),
+            )),
+            "/proc/meminfo" => Some(FileHandle::new(
+                "/proc/meminfo",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcMeminfo),
+            )),
+            "/proc/uptime" => Some(FileHandle::new(
+                "/proc/uptime",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcUptime),
+            )),
+            "/proc/loadavg" => Some(FileHandle::new(
+                "/proc/loadavg",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcLoadavg),
+            )),
+            "/proc/stat" => Some(FileHandle::new(
+                "/proc/stat",
+                OpenFlags::RDONLY,
+                FileMode::from_bits_truncate(0o444),
+                Box::new(ProcStat),
+            )),
+            _ => None,
+        }
     }
 
     pub fn close(&mut self, fd: i32) -> Result<(), i64> {
@@ -191,7 +247,7 @@ impl VirtualFileSystem {
 
     pub fn chdir(&mut self, path: &str) -> Result<(), i64> {
         if path.starts_with('/') {
-            if self.dev_fs.exists(&path[1..]) || self.root_fs.exists(path) {
+            if self.dev_fs.exists(&path[1..]) || self.root_fs.exists(path) || self.proc_path_exists(path) {
                 let owned_path = path.to_string();
                 self.cwd = Box::leak(owned_path.into_boxed_str());
                 Ok(())
@@ -204,7 +260,7 @@ impl VirtualFileSystem {
             } else {
                 format!("{}/{}", self.cwd, path)
             };
-            if self.dev_fs.exists(&new_path[1..]) || self.root_fs.exists(&new_path) {
+            if self.dev_fs.exists(&new_path[1..]) || self.root_fs.exists(&new_path) || self.proc_path_exists(&new_path) {
                 self.cwd = Box::leak(new_path.into_boxed_str());
                 Ok(())
             } else {
@@ -220,11 +276,30 @@ impl VirtualFileSystem {
             } else {
                 Err(-crate::vm::syscall::linux::ENOENT)
             }
+        } else if path.starts_with("/proc/") || path == "/proc" {
+            if self.proc_path_exists(path) {
+                Ok(())
+            } else {
+                Err(-crate::vm::syscall::linux::ENOENT)
+            }
         } else if self.root_fs.exists(path) {
             Ok(())
         } else {
             Err(-crate::vm::syscall::linux::ENOENT)
         }
+    }
+
+    fn proc_path_exists(&self, path: &str) -> bool {
+        matches!(path, 
+            "/proc" | 
+            "/proc/version" | 
+            "/proc/cmdline" | 
+            "/proc/cpuinfo" | 
+            "/proc/meminfo" | 
+            "/proc/uptime" | 
+            "/proc/loadavg" | 
+            "/proc/stat"
+        )
     }
 }
 

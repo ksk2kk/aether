@@ -23,6 +23,9 @@ pub fn init(virt_provider: &mut dyn VirtualizationProvider) {
     crate::vm::fs::init_vfs();
     crate::log_debug!("虚拟文件系统 (VFS) 已初始化");
 
+    crate::vm::syscall::linux::init_process_manager();
+    crate::log_debug!("进程管理器已初始化");
+
     let specs = crate::memory::guest_image_specs();
     let mut registered_ids_vec: Vec<u32> = Vec::new();
 
